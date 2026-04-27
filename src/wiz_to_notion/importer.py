@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import copy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -158,6 +159,77 @@ def _note_key(note: PreparedMarkdownNote) -> str:
     return note.relative_path.as_posix()
 
 
+def _iter_child_pages(notion_client: Any, parent_page_id: str) -> Iterable[dict[str, Any]]:
+    if hasattr(notion_client, "iter_block_children"):
+        yield from notion_client.iter_block_children(parent_page_id)
+        return
+    if hasattr(notion_client, "list_block_children"):
+        start_cursor: str | None = None
+        while True:
+            response = notion_client.list_block_children(parent_page_id, start_cursor=start_cursor, page_size=100)
+            for item in response.get("results", []):
+                if isinstance(item, dict):
+                    yield item
+            if not response.get("has_more"):
+                return
+            next_cursor = response.get("next_cursor")
+            start_cursor = str(next_cursor) if next_cursor else None
+            if not start_cursor:
+                return
+
+
+def _child_page_index(
+    *,
+    parent_page_id: str,
+    notion_client: Any,
+    child_page_cache: dict[str, dict[str, list[str]]],
+) -> dict[str, list[str]]:
+    cached = child_page_cache.get(parent_page_id)
+    if cached is not None:
+        return cached
+
+    by_title: dict[str, list[str]] = defaultdict(list)
+    for item in _iter_child_pages(notion_client, parent_page_id):
+        if item.get("type") != "child_page" or item.get("in_trash"):
+            continue
+        title = str(item.get("child_page", {}).get("title") or "").strip()
+        page_id = str(item.get("id") or "").strip()
+        if title and page_id:
+            by_title[title].append(page_id)
+    child_page_cache[parent_page_id] = dict(by_title)
+    return child_page_cache[parent_page_id]
+
+
+def _cache_child_page(
+    *,
+    parent_page_id: str,
+    title: str,
+    page_id: str,
+    child_page_cache: dict[str, dict[str, list[str]]],
+) -> None:
+    by_title = child_page_cache.setdefault(parent_page_id, {})
+    pages = by_title.setdefault(title, [])
+    if page_id not in pages:
+        pages.append(page_id)
+
+
+def _unique_child_page_id(
+    *,
+    parent_page_id: str,
+    title: str,
+    notion_client: Any,
+    child_page_cache: dict[str, dict[str, list[str]]],
+) -> str | None:
+    matches = _child_page_index(
+        parent_page_id=parent_page_id,
+        notion_client=notion_client,
+        child_page_cache=child_page_cache,
+    ).get(title, [])
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def _ensure_folder_pages(
     *,
     note: PreparedMarkdownNote,
@@ -166,11 +238,13 @@ def _ensure_folder_pages(
     state: dict[str, Any],
     resume: bool,
     dry_run: bool,
+    child_page_cache: dict[str, dict[str, list[str]]],
     progress: Callable[[str], None] | None = None,
     note_label: str = "",
-) -> tuple[str, int]:
+) -> tuple[str, int, bool]:
     parent_page_id = root_parent_page_id
     created = 0
+    state_changed = False
     folder_parts = note.relative_path.parent.parts
     accumulated: list[str] = []
     folders = state.setdefault("folders", {})
@@ -183,20 +257,46 @@ def _ensure_folder_pages(
             parent_page_id = existing_page_id
             continue
 
-        created += 1
         if dry_run:
+            created += 1
             parent_page_id = f"dry-run-folder:{folder_key}"
             continue
 
+        discovered_page_id = _unique_child_page_id(
+            parent_page_id=parent_page_id,
+            title=folder_name,
+            notion_client=notion_client,
+            child_page_cache=child_page_cache,
+        )
+        if discovered_page_id:
+            parent_page_id = discovered_page_id
+            folders[folder_key] = {
+                "page_id": parent_page_id,
+                "title": folder_name,
+                "discovered_at": _now_iso(),
+            }
+            state_changed = True
+            _emit_progress(progress, note_label, f"reusing existing folder page: {folder_name}")
+            continue
+
+        created += 1
         _emit_progress(progress, note_label, f"creating folder page: {folder_name}")
-        response = notion_client.create_page(parent_page_id=parent_page_id, title=folder_name, markdown=None)
+        folder_parent_id = parent_page_id
+        response = notion_client.create_page(parent_page_id=folder_parent_id, title=folder_name, markdown=None)
         parent_page_id = str(response["id"])
+        _cache_child_page(
+            parent_page_id=folder_parent_id,
+            title=folder_name,
+            page_id=parent_page_id,
+            child_page_cache=child_page_cache,
+        )
         folders[folder_key] = {
             "page_id": parent_page_id,
             "title": folder_name,
             "created_at": _now_iso(),
         }
-    return parent_page_id, created
+        state_changed = True
+    return parent_page_id, created, state_changed
 
 
 def _is_markdown_parse_error(error: NotionApiError) -> bool:
@@ -258,6 +358,16 @@ def _upload_asset_block(
     return build_file_block(upload_id, asset.path, caption=caption)
 
 
+def _is_skippable_asset_upload_error(error: NotionApiError) -> bool:
+    if error.status_code != 400 or error.code != "validation_error":
+        return False
+    message = error.message.lower()
+    return (
+        "extension that is not supported for the file upload api" in message
+        or ("file size of" in message and "exceeds the limit" in message)
+    )
+
+
 def _blocks_with_uploaded_assets(
     *,
     blocks: list[dict[str, Any]],
@@ -287,11 +397,16 @@ def _blocks_with_uploaded_assets(
                 note_label,
                 f"uploading asset {asset_index}/{len(note.assets)}: {asset.path.name}",
             )
-        asset_block = _upload_asset_block(
-            asset=asset,
-            notion_client=notion_client,
-            max_upload_bytes=max_upload_bytes,
-        )
+        try:
+            asset_block = _upload_asset_block(
+                asset=asset,
+                notion_client=notion_client,
+                max_upload_bytes=max_upload_bytes,
+            )
+        except NotionApiError as exc:
+            if not _is_skippable_asset_upload_error(exc):
+                raise
+            asset_block = None
         if asset_block is None:
             skipped_assets.add(asset)
             skipped += 1
@@ -343,12 +458,15 @@ def _create_note_page(
     note: PreparedMarkdownNote,
     upload_assets: bool,
     max_upload_bytes: int,
+    on_page_created: Callable[[dict[str, Any]], None] | None = None,
     progress: Callable[[str], None] | None = None,
     note_label: str = "",
 ) -> tuple[dict[str, Any], str, int, int]:
     if upload_assets and note.assets:
         _emit_progress(progress, note_label, "creating page")
         page = notion_client.create_page(parent_page_id=parent_page_id, title=note.title, markdown=None)
+        if on_page_created is not None:
+            on_page_created(page)
         _emit_progress(progress, note_label, "rendering blocks")
         blocks = markdown_to_blocks(note.markdown)
         blocks, uploaded, skipped = _blocks_with_uploaded_assets(
@@ -382,11 +500,60 @@ def _create_note_page(
 
     _emit_progress(progress, note_label, "markdown rejected, falling back to blocks")
     page = notion_client.create_page(parent_page_id=parent_page_id, title=note.title, markdown=None)
+    if on_page_created is not None:
+        on_page_created(page)
     blocks = markdown_to_blocks(note.markdown)
     if blocks:
         _emit_progress(progress, note_label, f"appending {len(blocks)} blocks")
         notion_client.append_blocks(str(page["id"]), blocks)
     return page, "imported_with_blocks", 0, 0
+
+
+def _update_note_page(
+    *,
+    notion_client: Any,
+    page_id: str,
+    note: PreparedMarkdownNote,
+    upload_assets: bool,
+    max_upload_bytes: int,
+    progress: Callable[[str], None] | None = None,
+    note_label: str = "",
+) -> tuple[dict[str, Any], str, int, int]:
+    if upload_assets and note.assets:
+        _emit_progress(progress, note_label, "updating page and clearing existing content")
+        page = notion_client.update_page(page_id=page_id, title=note.title, erase_content=True)
+        _emit_progress(progress, note_label, "rendering blocks")
+        blocks = markdown_to_blocks(note.markdown)
+        blocks, uploaded, skipped = _blocks_with_uploaded_assets(
+            blocks=blocks,
+            note=note,
+            notion_client=notion_client,
+            max_upload_bytes=max_upload_bytes,
+            progress=progress,
+            note_label=note_label,
+        )
+        if blocks:
+            _emit_progress(progress, note_label, f"appending {len(blocks)} blocks")
+            notion_client.append_blocks(page_id, blocks)
+        return page, "updated_with_blocks", uploaded, skipped
+
+    _emit_progress(progress, note_label, "updating page title")
+    page = notion_client.update_page(page_id=page_id, title=note.title)
+    try:
+        _emit_progress(progress, note_label, "replacing page markdown")
+        notion_client.update_page_markdown(page_id=page_id, markdown=note.markdown)
+        return page, "updated", 0, 0
+    except NotionApiError as exc:
+        if not _is_markdown_parse_error(exc):
+            raise
+
+    _emit_progress(progress, note_label, "markdown rejected, replacing content with blocks")
+    page = notion_client.update_page(page_id=page_id, title=note.title, erase_content=True)
+    blocks = markdown_to_blocks(note.markdown)
+    if blocks:
+        _emit_progress(progress, note_label, f"appending {len(blocks)} blocks")
+        notion_client.append_blocks(page_id, blocks)
+    return page, "updated_with_blocks", 0, 0
 
 
 def _clear_folder_state_for_note(*, state: dict[str, Any], note: PreparedMarkdownNote) -> None:
@@ -395,6 +562,34 @@ def _clear_folder_state_for_note(*, state: dict[str, Any], note: PreparedMarkdow
     for folder_name in note.relative_path.parent.parts:
         accumulated.append(folder_name)
         folders.pop("/".join(accumulated), None)
+
+
+def _write_partial_note_state(
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    note_key: str,
+    note: PreparedMarkdownNote,
+    page: dict[str, Any],
+    upload_assets: bool,
+) -> None:
+    page_id = str(page.get("id") or "").strip()
+    if not page_id:
+        return
+    page_url = str(page.get("url") or "")
+    state.setdefault("notes", {})[note_key] = {
+        "page_id": page_id,
+        "url": page_url,
+        "title": note.title,
+        "fingerprint": None,
+        "renderer_version": 0,
+        "asset_count": len(note.assets),
+        "uploaded_assets": 0,
+        "skipped_assets": 0,
+        "asset_upload_attempted": bool(upload_assets),
+        "import_started_at": _now_iso(),
+    }
+    _write_json(state_path, state)
 
 
 def import_markdown_tree(
@@ -420,6 +615,7 @@ def import_markdown_tree(
     state = _load_state(state_path)
     paths = iter_markdown_paths(source_dir, include_wiz_meta=include_wiz_meta, limit=limit)
     reports: list[ImportedNoteReport] = []
+    child_page_cache: dict[str, dict[str, list[str]]] = {}
 
     imported_notes = 0
     skipped_notes = 0
@@ -454,19 +650,31 @@ def import_markdown_tree(
             )
             continue
 
-        folder_parent_id, folder_created = _ensure_folder_pages(
+        existing_page_id = _state_page_id(state_entry) if resume else None
+        folder_parent_id, folder_created, folder_state_changed = _ensure_folder_pages(
             note=prepared,
             root_parent_page_id=parent_page_id,
             notion_client=notion_client,
             state=state,
             resume=resume,
             dry_run=dry_run,
+            child_page_cache=child_page_cache,
             progress=progress,
             note_label=note_label,
         )
         created_folders += folder_created
-        if folder_created and not dry_run:
+        if (folder_created or folder_state_changed) and not dry_run:
             _write_json(state_path, state)
+
+        if resume and not dry_run and existing_page_id is None:
+            existing_page_id = _unique_child_page_id(
+                parent_page_id=folder_parent_id,
+                title=prepared.title,
+                notion_client=notion_client,
+                child_page_cache=child_page_cache,
+            )
+            if existing_page_id:
+                _emit_progress(progress, note_label, "reusing existing page discovered in Notion")
 
         if dry_run:
             _emit_progress(progress, note_label, "dry run complete")
@@ -485,38 +693,72 @@ def import_markdown_tree(
 
         try:
             try:
-                page, note_status, note_uploaded_assets, note_skipped_assets = _create_note_page(
-                    notion_client=notion_client,
-                    parent_page_id=folder_parent_id,
-                    note=prepared,
-                    upload_assets=upload_assets,
-                    max_upload_bytes=max_upload_bytes,
-                    progress=progress,
-                    note_label=note_label,
-                )
+                def on_page_created(page: dict[str, Any]) -> None:
+                    _cache_child_page(
+                        parent_page_id=folder_parent_id,
+                        title=prepared.title,
+                        page_id=str(page.get("id") or ""),
+                        child_page_cache=child_page_cache,
+                    )
+                    _write_partial_note_state(
+                        state=state,
+                        state_path=state_path,
+                        note_key=key,
+                        note=prepared,
+                        page=page,
+                        upload_assets=upload_assets,
+                    )
+
+                if existing_page_id:
+                    page, note_status, note_uploaded_assets, note_skipped_assets = _update_note_page(
+                        notion_client=notion_client,
+                        page_id=existing_page_id,
+                        note=prepared,
+                        upload_assets=upload_assets,
+                        max_upload_bytes=max_upload_bytes,
+                        progress=progress,
+                        note_label=note_label,
+                    )
+                else:
+                    page, note_status, note_uploaded_assets, note_skipped_assets = _create_note_page(
+                        notion_client=notion_client,
+                        parent_page_id=folder_parent_id,
+                        note=prepared,
+                        upload_assets=upload_assets,
+                        max_upload_bytes=max_upload_bytes,
+                        on_page_created=on_page_created,
+                        progress=progress,
+                        note_label=note_label,
+                    )
             except NotionApiError as exc:
+                if existing_page_id:
+                    raise
                 if not (resume and prepared.relative_path.parent.parts and _is_archived_block_error(exc)):
                     raise
                 _emit_progress(progress, note_label, "folder page archived, recreating folder path")
                 _clear_folder_state_for_note(state=state, note=prepared)
-                folder_parent_id, recreated_folders = _ensure_folder_pages(
+                child_page_cache.clear()
+                folder_parent_id, recreated_folders, recreated_folder_state = _ensure_folder_pages(
                     note=prepared,
                     root_parent_page_id=parent_page_id,
                     notion_client=notion_client,
                     state=state,
                     resume=resume,
                     dry_run=dry_run,
+                    child_page_cache=child_page_cache,
                     progress=progress,
                     note_label=note_label,
                 )
                 created_folders += recreated_folders
-                _write_json(state_path, state)
+                if recreated_folders or recreated_folder_state:
+                    _write_json(state_path, state)
                 page, note_status, note_uploaded_assets, note_skipped_assets = _create_note_page(
                     notion_client=notion_client,
                     parent_page_id=folder_parent_id,
                     note=prepared,
                     upload_assets=upload_assets,
                     max_upload_bytes=max_upload_bytes,
+                    on_page_created=on_page_created,
                     progress=progress,
                     note_label=note_label,
                 )

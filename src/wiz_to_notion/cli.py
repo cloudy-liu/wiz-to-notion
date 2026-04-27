@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import sys
@@ -18,6 +19,7 @@ from .config import (
     default_source_dir,
     default_token,
 )
+from .cleanup import cleanup_duplicate_pages
 from .importer import import_markdown_tree, scan_markdown_tree
 from .notion import NotionApiError, NotionClient, extract_page_id
 
@@ -32,8 +34,21 @@ def _split_dotenv_assignment(line: str) -> tuple[str, str] | None:
     return None
 
 
+def _default_dotenv_path() -> Path:
+    cwd_path = Path.cwd() / ".env"
+    if cwd_path.exists():
+        return cwd_path
+
+    if getattr(sys, "frozen", False):
+        executable_path = Path(sys.executable).resolve().parent / ".env"
+        if executable_path.exists():
+            return executable_path
+
+    return cwd_path
+
+
 def load_dotenv(path: Path | None = None) -> None:
-    path = path or Path.cwd() / ".env"
+    path = path or _default_dotenv_path()
     if not path.exists():
         return
 
@@ -78,6 +93,16 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--max-upload-mb", type=float, default=20.0)
     import_parser.add_argument("--request-delay", type=float, default=0.35)
     import_parser.add_argument("--stop-on-error", action="store_true")
+
+    cleanup_parser = subparsers.add_parser("cleanup-duplicates", help="Find and optionally trash redundant duplicate Notion pages.")
+    cleanup_parser.add_argument("--source", type=Path, default=None)
+    cleanup_parser.add_argument("--parent", default=None, help="Target Notion page id or URL.")
+    cleanup_parser.add_argument("--token", default=None, help=f"Notion integration token. Defaults to {TOKEN_ENV_VAR}.")
+    cleanup_parser.add_argument("--notion-version", default=None)
+    cleanup_parser.add_argument("--state", type=Path, default=None)
+    cleanup_parser.add_argument("--include-wiz-meta", action="store_true")
+    cleanup_parser.add_argument("--request-delay", type=float, default=0.35)
+    cleanup_parser.add_argument("--apply", action="store_true", help="Actually move redundant pages to trash.")
     return parser
 
 
@@ -88,6 +113,67 @@ def _write_json(stdout: TextIO, payload: dict) -> None:
 
 def _progress(stderr: TextIO, message: str) -> None:
     stderr.write(f"[import] {message}\n")
+    stderr.flush()
+
+
+def _write_import_summary(stderr: TextIO, result: object) -> None:
+    notes = getattr(result, "notes", ())
+    summary = getattr(result, "summary")
+    counts = Counter(getattr(note, "status", "") for note in notes)
+
+    if summary.dry_run:
+        stderr.write("Dry run complete.\n")
+        stderr.write(f"Scanned notes: {summary.total_notes}\n")
+        stderr.write(f"Would import: {counts.get('would_import', 0)}\n")
+        stderr.write(f"Skipped unchanged: {summary.skipped_notes}\n")
+        stderr.write(f"Failed: {summary.failed_notes}\n")
+        stderr.write(f"Unresolved links: {summary.unresolved_links}\n")
+        stderr.write("State/report files were not written because this was a dry run.\n")
+    else:
+        imported = sum(count for status, count in counts.items() if status.startswith("imported"))
+        updated = sum(count for status, count in counts.items() if status.startswith("updated"))
+        stderr.write("Import complete.\n")
+        stderr.write(f"Scanned notes: {summary.total_notes}\n")
+        stderr.write(f"Imported new pages: {imported}\n")
+        stderr.write(f"Updated existing pages: {updated}\n")
+        stderr.write(f"Skipped unchanged: {summary.skipped_notes}\n")
+        stderr.write(f"Failed: {summary.failed_notes}\n")
+        stderr.write(f"Uploaded assets: {summary.uploaded_assets}\n")
+        stderr.write(f"Skipped assets: {summary.skipped_assets}\n")
+        stderr.write(f"Unresolved links: {summary.unresolved_links}\n")
+        stderr.write(f"State file: {result.state_path}\n")
+        stderr.write(f"Report file: {result.report_path}\n")
+
+    failed_notes = [note for note in notes if getattr(note, "status", "") == "failed"]
+    if failed_notes:
+        stderr.write("Failed notes:\n")
+        for note in failed_notes[:5]:
+            error = getattr(note, "error", "") or "unknown error"
+            stderr.write(f"- {note.relative_path}: {error}\n")
+        remaining = len(failed_notes) - 5
+        if remaining > 0:
+            stderr.write(f"- ... and {remaining} more\n")
+    stderr.flush()
+
+
+def _write_cleanup_summary(stderr: TextIO, payload: dict[str, object], *, applied: bool) -> None:
+    groups = payload.get("duplicate_groups", [])
+    page_ids = payload.get("page_ids_to_trash", [])
+    stderr.write("Duplicate cleanup complete.\n" if applied else "Duplicate cleanup dry run complete.\n")
+    stderr.write(f"Scanned child pages: {payload.get('total_child_pages', 0)}\n")
+    stderr.write(f"Duplicate groups: {len(groups) if isinstance(groups, list) else 0}\n")
+    stderr.write(f"Pages to trash: {len(page_ids) if isinstance(page_ids, list) else 0}\n")
+    if isinstance(groups, list) and groups:
+        stderr.write("Duplicate groups:\n")
+        for group in groups[:10]:
+            stderr.write(
+                f"- {(group.get('parent_path') or '<root>')}/{group.get('title')}: "
+                f"actual={group.get('actual_count')} expected={group.get('expected_count')} "
+                f"remove={len(group.get('remove_ids') or [])}\n"
+            )
+        remaining = len(groups) - 10
+        if remaining > 0:
+            stderr.write(f"- ... and {remaining} more\n")
     stderr.flush()
 
 
@@ -103,7 +189,21 @@ def _write_notion_error(stderr: TextIO, error: NotionApiError, *, parent_page_id
 
 
 def _resolved_source(source_arg: Path | None) -> Path:
-    return source_arg.expanduser() if source_arg is not None else default_source_dir()
+    if source_arg is not None:
+        return source_arg.expanduser()
+    source_dir = default_source_dir()
+    if source_dir is None:
+        raise ValueError(f"missing source directory: pass --source or set {SOURCE_ENV_VAR} in .env.")
+    return source_dir
+
+
+def _resolved_parent_page(parent_arg: str | None) -> str:
+    if parent_arg:
+        return parent_arg
+    parent_page = default_parent_page()
+    if parent_page:
+        return parent_page
+    raise ValueError(f"missing Notion parent page: pass --parent or set {PARENT_ENV_VAR} in .env.")
 
 
 def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr: TextIO | None = None) -> int:
@@ -114,7 +214,10 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
     args = parser.parse_args(argv)
 
     if args.command == "scan":
-        source_dir = _resolved_source(args.source)
+        try:
+            source_dir = _resolved_source(args.source)
+        except ValueError as exc:
+            parser.error(str(exc))
         payload = scan_markdown_tree(
             source_dir=source_dir,
             limit=args.limit,
@@ -124,8 +227,11 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
         return 0
 
     if args.command == "import":
-        source_dir = _resolved_source(args.source)
-        parent_value = args.parent or default_parent_page()
+        try:
+            source_dir = _resolved_source(args.source)
+            parent_value = _resolved_parent_page(args.parent)
+        except ValueError as exc:
+            parser.error(str(exc))
         parent_page_id = extract_page_id(parent_value)
         token = args.token or default_token()
         notion_version = args.notion_version or default_notion_version()
@@ -170,6 +276,49 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
         payload["parent_env"] = PARENT_ENV_VAR
         payload["version_env"] = VERSION_ENV_VAR
         _write_json(stdout, payload)
+        _write_import_summary(stderr, result)
+        return 0
+
+    if args.command == "cleanup-duplicates":
+        try:
+            source_dir = _resolved_source(args.source)
+            parent_value = _resolved_parent_page(args.parent)
+        except ValueError as exc:
+            parser.error(str(exc))
+        parent_page_id = extract_page_id(parent_value)
+        token = args.token or default_token()
+        notion_version = args.notion_version or default_notion_version()
+
+        if not token:
+            parser.error(
+                "missing Notion token: pass --token or set "
+                f"{TOKEN_ENV_VAR}=ntn_... in .env. {ALT_TOKEN_ENV_VAR} is also accepted."
+            )
+
+        notion_client = NotionClient(
+            token=token,
+            notion_version=notion_version,
+            request_delay=args.request_delay,
+        )
+        state_path = args.state or (source_dir / "_wiz" / "notion_import_state.json")
+        try:
+            plan = cleanup_duplicate_pages(
+                source_dir=source_dir,
+                root_page_id=parent_page_id,
+                notion_client=notion_client,
+                state_path=state_path,
+                include_wiz_meta=args.include_wiz_meta,
+                dry_run=not args.apply,
+                progress=lambda message: _progress(stderr, message),
+            )
+        except NotionApiError as exc:
+            _write_notion_error(stderr, exc, parent_page_id=parent_page_id)
+            return 1
+        payload = plan.to_dict()
+        payload["notion_version"] = notion_version
+        payload["state_path"] = str(state_path)
+        _write_json(stdout, payload)
+        _write_cleanup_summary(stderr, payload, applied=args.apply)
         return 0
 
     parser.error(f"unknown command: {args.command}")

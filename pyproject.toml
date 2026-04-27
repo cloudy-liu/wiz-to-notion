@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wiz-to-notion"
 version = "0.1.0"
-description = "Import exported Wiz/Obsidian Markdown notes into Notion"
+description = "Import Markdown note trees into Notion, with Wiz export compatibility"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,4 +20,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -74,6 +74,32 @@ class MarkdownBlockConversionTests(unittest.TestCase):
         self.assertEqual("plain text", blocks[0]["code"]["language"])
         self.assertEqual("hello", blocks[0]["code"]["rich_text"][0]["text"]["content"])
 
+    def test_normalizes_notion_code_language_aliases(self) -> None:
+        from wiz_to_notion.blocks import markdown_to_blocks
+
+        blocks = markdown_to_blocks(
+            "\n".join(
+                [
+                    "```c/c++",
+                    "int main() {}",
+                    "```",
+                    "",
+                    "```cpp",
+                    "int main() {}",
+                    "```",
+                    "",
+                    "```pl/sql",
+                    "select 1;",
+                    "```",
+                ]
+            )
+        )
+
+        self.assertEqual(["code", "code", "code"], [block["type"] for block in blocks])
+        self.assertEqual("c++", blocks[0]["code"]["language"])
+        self.assertEqual("c++", blocks[1]["code"]["language"])
+        self.assertEqual("sql", blocks[2]["code"]["language"])
+
     def test_ignores_stray_empty_fence_before_heading(self) -> None:
         from wiz_to_notion.blocks import markdown_to_blocks
 
@@ -123,6 +149,21 @@ class MarkdownBlockConversionTests(unittest.TestCase):
 
         self.assertEqual("Guide [LWN.net]", rich[0]["text"]["content"])
         self.assertEqual({"url": "https://example.com"}, rich[0]["text"]["link"])
+
+    def test_degrades_malformed_http_links_to_plain_text(self) -> None:
+        from wiz_to_notion.blocks import rich_text_from_markdown
+
+        rich = rich_text_from_markdown(
+            "[Broken](http://i.%20https//github.com/google/perfetto/commit/97802ac42a9706752ae0265e388332daea03021f)"
+        )
+
+        self.assertEqual(
+            [item["text"]["content"] for item in rich],
+            [
+                "Broken (http://i.%20https//github.com/google/perfetto/commit/97802ac42a9706752ae0265e388332daea03021f)"
+            ],
+        )
+        self.assertTrue(all("link" not in item["text"] for item in rich))
 
     def test_converts_markdown_tables(self) -> None:
         from wiz_to_notion.blocks import markdown_to_blocks

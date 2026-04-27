@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 
 MAX_RICH_TEXT_CHARS = 1900
@@ -36,6 +37,9 @@ IMAGE_EXTENSIONS = {
 }
 
 LANGUAGE_ALIASES = {
+    "c/c++": "c++",
+    "cpp": "c++",
+    "pl/sql": "sql",
     "ps1": "powershell",
     "powershell": "powershell",
     "shell": "shell",
@@ -96,8 +100,50 @@ def _merge_annotations(
 
 
 def _is_supported_link_target(target: str) -> bool:
-    parsed = urlparse(target.strip())
-    return parsed.scheme.lower() in {"http", "https", "mailto"}
+    return _normalize_supported_link_target(target) is not None
+
+
+def _contains_disallowed_url_chars(target: str) -> bool:
+    return any(char.isspace() for char in target) or any(char in target for char in {"<", ">", "\\"})
+
+
+def _is_valid_hostname(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    if hostname.endswith("."):
+        hostname = hostname[:-1]
+    if not hostname or "%" in hostname or "_" in hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+
+    labels = hostname.split(".")
+    if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-") for label in labels):
+        return False
+    try:
+        hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return True
+
+
+def _normalize_supported_link_target(target: str) -> str | None:
+    normalized = _clean_markdown_target(target)
+    if not normalized or _contains_disallowed_url_chars(normalized):
+        return None
+
+    parsed = urlsplit(normalized)
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"}:
+        if not parsed.netloc or not _is_valid_hostname(parsed.hostname):
+            return None
+        return normalized
+    if scheme == "mailto":
+        return normalized if parsed.path else None
+    return None
 
 
 def _clean_markdown_target(target: str) -> str:
@@ -110,7 +156,10 @@ def _clean_markdown_target(target: str) -> str:
 
 
 def _is_external_image_target(target: str) -> bool:
-    parsed = urlparse(target)
+    normalized = _normalize_supported_link_target(target)
+    if normalized is None:
+        return False
+    parsed = urlparse(normalized)
     if parsed.scheme.lower() not in {"http", "https"}:
         return False
     return any(parsed.path.lower().endswith(extension) for extension in IMAGE_EXTENSIONS)
@@ -142,12 +191,13 @@ def _parse_inline_markdown(
         if match.group("link"):
             label = match.group("link_label").strip() or match.group("link_url")
             target = _clean_markdown_target(match.group("link_url") or "")
-            if _is_supported_link_target(target):
+            normalized_target = _normalize_supported_link_target(target)
+            if normalized_target is not None:
                 rich_text.extend(
                     _parse_inline_markdown(
                         label,
                         annotations=annotations,
-                        url=target,
+                        url=normalized_target,
                         depth=depth + 1,
                     )
                 )

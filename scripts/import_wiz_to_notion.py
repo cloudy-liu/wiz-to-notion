@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     root = repo_root()
     python = resolve_python(root)
-    cli_args = argv if argv and argv[0] in {"scan", "import"} else ["import", *argv]
+    cli_args = argv if argv and argv[0] in {"scan", "import", "cleanup-duplicates"} else ["import", *argv]
     completed = subprocess.run(
         [str(python), "-m", "wiz_to_notion.cli", *cli_args],
         cwd=root,
@@ -41,4 +41,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -9,6 +9,8 @@ from pathlib import Path
 class FakeNotionClient:
     def __init__(self) -> None:
         self.created_pages: list[dict[str, object]] = []
+        self.updated_pages: list[dict[str, object]] = []
+        self.updated_markdown_pages: list[dict[str, object]] = []
         self.uploaded_files: list[Path] = []
         self.appended_blocks: list[tuple[str, list[dict[str, object]]]] = []
 
@@ -31,6 +33,46 @@ class FakeNotionClient:
     def append_blocks(self, block_id: str, children: list[dict[str, object]]) -> dict[str, object]:
         self.appended_blocks.append((block_id, children))
         return {"object": "list"}
+
+    def update_page(
+        self,
+        *,
+        page_id: str,
+        title: str | None = None,
+        erase_content: bool = False,
+    ) -> dict[str, object]:
+        self.updated_pages.append(
+            {
+                "page_id": page_id,
+                "title": title,
+                "erase_content": erase_content,
+            }
+        )
+        return {"id": page_id, "url": f"https://notion.local/{page_id}"}
+
+    def update_page_markdown(self, *, page_id: str, markdown: str) -> dict[str, object]:
+        self.updated_markdown_pages.append(
+            {
+                "page_id": page_id,
+                "markdown": markdown,
+            }
+        )
+        return {"object": "page_markdown", "id": page_id, "markdown": markdown, "truncated": False, "unknown_block_ids": []}
+
+    def list_block_children(self, block_id: str, *, start_cursor: str | None = None, page_size: int = 100) -> dict[str, object]:
+        return {"results": [], "has_more": False, "next_cursor": None}
+
+    def iter_block_children(self, block_id: str, *, page_size: int = 100):
+        start_cursor: str | None = None
+        while True:
+            response = self.list_block_children(block_id, start_cursor=start_cursor, page_size=page_size)
+            for item in response.get("results", []):
+                yield item
+            if not response.get("has_more"):
+                return
+            start_cursor = response.get("next_cursor")
+            if not start_cursor:
+                return
 
 
 class ImporterTests(unittest.TestCase):
@@ -213,11 +255,12 @@ class ImporterTests(unittest.TestCase):
             state = json.loads(state_path.read_text(encoding="utf-8"))
 
         self.assertEqual(1, result.summary.imported_notes)
-        self.assertEqual("imported", result.notes[0].status)
-        self.assertEqual(["Roadmap"], [page["title"] for page in fake_client.created_pages])
+        self.assertEqual("updated", result.notes[0].status)
+        self.assertEqual([], fake_client.created_pages)
+        self.assertEqual([{"page_id": "old-page", "markdown": "# Roadmap"}], fake_client.updated_markdown_pages)
         self.assertEqual(5, state["notes"]["Roadmap.md"]["renderer_version"])
 
-    def test_resume_reimports_note_imported_without_assets_to_place_assets(self) -> None:
+    def test_resume_updates_existing_note_imported_without_assets_to_place_assets(self) -> None:
         from wiz_to_notion.importer import import_markdown_tree
         from wiz_to_notion.markdown import prepare_markdown_note
 
@@ -262,12 +305,119 @@ class ImporterTests(unittest.TestCase):
             )
 
         self.assertEqual(1, result.summary.imported_notes)
-        self.assertEqual("imported_with_blocks", result.notes[0].status)
-        self.assertEqual(["Roadmap"], [page["title"] for page in fake_client.created_pages])
+        self.assertEqual("updated_with_blocks", result.notes[0].status)
+        self.assertEqual([], fake_client.created_pages)
+        self.assertEqual(
+            [{"page_id": "page-note", "title": "Roadmap", "erase_content": True}],
+            fake_client.updated_pages,
+        )
         self.assertEqual([image], fake_client.uploaded_files)
-        self.assertEqual("page-1", fake_client.appended_blocks[0][0])
+        self.assertEqual("page-note", fake_client.appended_blocks[0][0])
         self.assertEqual(["heading_1", "image"], [block["type"] for block in fake_client.appended_blocks[0][1]])
         self.assertNotIn("caption", fake_client.appended_blocks[0][1][1]["image"])
+
+    def test_resume_updates_changed_note_in_place_instead_of_creating_duplicate_page(self) -> None:
+        from wiz_to_notion.importer import import_markdown_tree
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            note = source / "Roadmap.md"
+            note.write_text("# Roadmap\n\nUpdated body", encoding="utf-8")
+            state_path = source / "_wiz" / "state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "folders": {},
+                        "notes": {
+                            "Roadmap.md": {
+                                "page_id": "existing-page",
+                                "title": "Roadmap",
+                                "fingerprint": "stale-fingerprint",
+                                "renderer_version": 5,
+                                "asset_count": 0,
+                                "uploaded_assets": 0,
+                                "skipped_assets": 0,
+                                "asset_upload_attempted": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_client = FakeNotionClient()
+
+            result = import_markdown_tree(
+                source_dir=source,
+                parent_page_id=self.ROOT_PAGE_ID,
+                notion_client=fake_client,
+                state_path=state_path,
+                report_path=source / "_wiz" / "report.json",
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(1, result.summary.imported_notes)
+        self.assertEqual([], fake_client.created_pages)
+        self.assertEqual(
+            [{"page_id": "existing-page", "markdown": "# Roadmap\n\nUpdated body"}],
+            fake_client.updated_markdown_pages,
+        )
+        self.assertEqual([], fake_client.appended_blocks)
+        self.assertEqual("existing-page", state["notes"]["Roadmap.md"]["page_id"])
+
+    def test_resume_updates_changed_asset_note_in_place_without_creating_duplicate_page(self) -> None:
+        from wiz_to_notion.importer import import_markdown_tree
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            note = source / "Roadmap.md"
+            image = source / "_wiz" / "resources" / "doc-1" / "cover.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            note.write_text("# Roadmap\n\n![](_wiz/resources/doc-1/cover.png)", encoding="utf-8")
+            state_path = source / "_wiz" / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "folders": {},
+                        "notes": {
+                            "Roadmap.md": {
+                                "page_id": "existing-page",
+                                "title": "Roadmap",
+                                "fingerprint": "stale-fingerprint",
+                                "renderer_version": 5,
+                                "asset_count": 1,
+                                "uploaded_assets": 1,
+                                "skipped_assets": 0,
+                                "asset_upload_attempted": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_client = FakeNotionClient()
+
+            result = import_markdown_tree(
+                source_dir=source,
+                parent_page_id=self.ROOT_PAGE_ID,
+                notion_client=fake_client,
+                state_path=state_path,
+                report_path=source / "_wiz" / "report.json",
+                upload_assets=True,
+            )
+
+        self.assertEqual(1, result.summary.imported_notes)
+        self.assertEqual([], fake_client.created_pages)
+        self.assertEqual(
+            [{"page_id": "existing-page", "title": "Roadmap", "erase_content": True}],
+            fake_client.updated_pages,
+        )
+        self.assertEqual([image], fake_client.uploaded_files)
+        self.assertEqual("existing-page", fake_client.appended_blocks[0][0])
+        self.assertEqual(["heading_1", "image"], [block["type"] for block in fake_client.appended_blocks[0][1]])
 
     def test_recreates_state_folder_when_existing_folder_is_archived(self) -> None:
         from wiz_to_notion.importer import import_markdown_tree
@@ -386,6 +536,183 @@ class ImporterTests(unittest.TestCase):
                 "1/1 Roadmap.md - uploading asset 11/11: cover-11.png",
             ],
             asset_messages,
+        )
+
+    def test_import_skips_asset_when_notion_rejects_unsupported_extension(self) -> None:
+        from wiz_to_notion.importer import import_markdown_tree
+        from wiz_to_notion.notion import NotionApiError
+
+        class UnsupportedExtensionClient(FakeNotionClient):
+            def upload_file(self, path: Path) -> str:
+                if path.suffix.lower() == ".xmind":
+                    raise NotionApiError(
+                        400,
+                        "validation_error",
+                        "Provided `filename` has an extension that is not supported for the File Upload API.",
+                    )
+                return super().upload_file(path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            note = source / "Roadmap.md"
+            image = source / "_wiz" / "resources" / "doc-1" / "cover.png"
+            mindmap = source / "_wiz" / "resources" / "doc-1" / "plan.xmind"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            mindmap.write_bytes(b"xmind")
+            note.write_text(
+                "# Roadmap\n\n![](_wiz/resources/doc-1/cover.png)\n\n[plan](_wiz/resources/doc-1/plan.xmind)",
+                encoding="utf-8",
+            )
+            fake_client = UnsupportedExtensionClient()
+
+            result = import_markdown_tree(
+                source_dir=source,
+                parent_page_id=self.ROOT_PAGE_ID,
+                notion_client=fake_client,
+                state_path=source / "_wiz" / "state.json",
+                report_path=source / "_wiz" / "report.json",
+            )
+
+        self.assertEqual(1, result.summary.imported_notes)
+        self.assertEqual(0, result.summary.failed_notes)
+        self.assertEqual(1, result.summary.uploaded_assets)
+        self.assertEqual(1, result.summary.skipped_assets)
+        self.assertEqual(["heading_1", "image", "paragraph"], [block["type"] for block in fake_client.appended_blocks[0][1]])
+        self.assertIn("Attachment imported below: plan.xmind", fake_client.appended_blocks[0][1][2]["paragraph"]["rich_text"][0]["text"]["content"])
+
+    def test_import_skips_asset_when_notion_rejects_workspace_size_limit(self) -> None:
+        from wiz_to_notion.importer import import_markdown_tree
+        from wiz_to_notion.notion import NotionApiError
+
+        class SizeLimitClient(FakeNotionClient):
+            def upload_file(self, path: Path) -> str:
+                raise NotionApiError(
+                    400,
+                    "validation_error",
+                    "File size of 6.756 MiB exceeds the limit of 5 MiB.",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            note = source / "Roadmap.md"
+            image = source / "_wiz" / "resources" / "doc-1" / "cover.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            note.write_text("# Roadmap\n\n![](_wiz/resources/doc-1/cover.png)", encoding="utf-8")
+            fake_client = SizeLimitClient()
+
+            result = import_markdown_tree(
+                source_dir=source,
+                parent_page_id=self.ROOT_PAGE_ID,
+                notion_client=fake_client,
+                state_path=source / "_wiz" / "state.json",
+                report_path=source / "_wiz" / "report.json",
+            )
+
+        self.assertEqual(1, result.summary.imported_notes)
+        self.assertEqual(0, result.summary.failed_notes)
+        self.assertEqual(0, result.summary.uploaded_assets)
+        self.assertEqual(1, result.summary.skipped_assets)
+        self.assertEqual(["heading_1", "paragraph"], [block["type"] for block in fake_client.appended_blocks[0][1]])
+        self.assertIn("Image imported below: cover.png", fake_client.appended_blocks[0][1][1]["paragraph"]["rich_text"][0]["text"]["content"])
+
+    def test_failed_initial_asset_import_records_page_id_and_retry_updates_same_page(self) -> None:
+        from wiz_to_notion.importer import import_markdown_tree
+
+        class FailingAppendClient(FakeNotionClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_append_once = True
+
+            def append_blocks(self, block_id: str, children: list[dict[str, object]]) -> dict[str, object]:
+                if self.fail_append_once:
+                    self.fail_append_once = False
+                    raise RuntimeError("simulated append failure")
+                return super().append_blocks(block_id, children)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            note = source / "Roadmap.md"
+            image = source / "_wiz" / "resources" / "doc-1" / "cover.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            note.write_text("# Roadmap\n\n![](_wiz/resources/doc-1/cover.png)", encoding="utf-8")
+            state_path = source / "_wiz" / "state.json"
+            report_path = source / "_wiz" / "report.json"
+            fake_client = FailingAppendClient()
+
+            first = import_markdown_tree(
+                source_dir=source,
+                parent_page_id=self.ROOT_PAGE_ID,
+                notion_client=fake_client,
+                state_path=state_path,
+                report_path=report_path,
+            )
+            state_after_first = json.loads(state_path.read_text(encoding="utf-8"))
+
+            second = import_markdown_tree(
+                source_dir=source,
+                parent_page_id=self.ROOT_PAGE_ID,
+                notion_client=fake_client,
+                state_path=state_path,
+                report_path=report_path,
+            )
+
+        self.assertEqual(1, first.summary.failed_notes)
+        self.assertEqual("page-1", state_after_first["notes"]["Roadmap.md"]["page_id"])
+        self.assertEqual(1, len(fake_client.created_pages))
+        self.assertEqual(1, second.summary.imported_notes)
+        self.assertEqual([], fake_client.created_pages[1:])
+        self.assertEqual(
+            [{"page_id": "page-1", "title": "Roadmap", "erase_content": True}],
+            fake_client.updated_pages,
+        )
+        self.assertEqual("page-1", fake_client.appended_blocks[0][0])
+
+    def test_reuses_existing_unique_live_page_when_state_entry_is_missing(self) -> None:
+        from wiz_to_notion.importer import import_markdown_tree
+
+        class DiscoveringClient(FakeNotionClient):
+            ROOT_ID = ImporterTests.ROOT_PAGE_ID_DASHED
+
+            def list_block_children(self, block_id: str, *, start_cursor: str | None = None, page_size: int = 100) -> dict[str, object]:
+                if block_id == self.ROOT_ID:
+                    return {
+                        "results": [
+                            {
+                                "id": "existing-page",
+                                "type": "child_page",
+                                "child_page": {"title": "Roadmap"},
+                                "in_trash": False,
+                                "created_time": "2026-04-26T00:00:00.000Z",
+                                "last_edited_time": "2026-04-26T00:00:00.000Z",
+                            }
+                        ],
+                        "has_more": False,
+                        "next_cursor": None,
+                    }
+                return {"results": [], "has_more": False, "next_cursor": None}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            note = source / "Roadmap.md"
+            note.write_text("# Roadmap\n\nUpdated body", encoding="utf-8")
+            fake_client = DiscoveringClient()
+
+            result = import_markdown_tree(
+                source_dir=source,
+                parent_page_id=self.ROOT_PAGE_ID,
+                notion_client=fake_client,
+                state_path=source / "_wiz" / "state.json",
+                report_path=source / "_wiz" / "report.json",
+            )
+
+        self.assertEqual(1, result.summary.imported_notes)
+        self.assertEqual([], fake_client.created_pages)
+        self.assertEqual(
+            [{"page_id": "existing-page", "markdown": "# Roadmap\n\nUpdated body"}],
+            fake_client.updated_markdown_pages,
         )
 
 
