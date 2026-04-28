@@ -120,4 +120,4 @@ jobs:
             -Headers $headers `
             -ContentType "application/zip" `
             -InFile $archivePath `
-            -Uri "$uploadUrl?name=$archiveName"
+            -Uri ("{0}?name={1}" -f $uploadUrl, [System.Uri]::EscapeDataString($archiveName))

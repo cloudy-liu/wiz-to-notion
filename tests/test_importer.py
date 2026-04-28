@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,11 @@ class ImporterTests(unittest.TestCase):
     ROOT_PAGE_ID = "3487344d42e7808a9a14c9787050ab7a"
     ROOT_PAGE_ID_DASHED = "3487344d-42e7-808a-9a14-c9787050ab7a"
 
+    def assertPathsEquivalent(self, expected: Path, actual: Path) -> None:
+        expected_real = os.path.normcase(os.path.realpath(expected))
+        actual_real = os.path.normcase(os.path.realpath(actual))
+        self.assertEqual(expected_real, actual_real)
+
     def test_import_creates_folder_pages_note_pages_assets_in_place_and_state(self) -> None:
         from wiz_to_notion.importer import import_markdown_tree
 
@@ -111,7 +117,8 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(["AI", "Roadmap"], [call["title"] for call in fake_client.created_pages])
             self.assertEqual(self.ROOT_PAGE_ID_DASHED, fake_client.created_pages[0]["parent_page_id"])
             self.assertEqual("page-1", fake_client.created_pages[1]["parent_page_id"])
-            self.assertEqual([image], fake_client.uploaded_files)
+            self.assertEqual(1, len(fake_client.uploaded_files))
+            self.assertPathsEquivalent(image, fake_client.uploaded_files[0])
             self.assertEqual("page-2", fake_client.appended_blocks[0][0])
             appended_types = [block["type"] for block in fake_client.appended_blocks[0][1]]
             self.assertEqual(["heading_1", "paragraph", "image", "paragraph"], appended_types)
@@ -311,7 +318,8 @@ class ImporterTests(unittest.TestCase):
             [{"page_id": "page-note", "title": "Roadmap", "erase_content": True}],
             fake_client.updated_pages,
         )
-        self.assertEqual([image], fake_client.uploaded_files)
+        self.assertEqual(1, len(fake_client.uploaded_files))
+        self.assertPathsEquivalent(image, fake_client.uploaded_files[0])
         self.assertEqual("page-note", fake_client.appended_blocks[0][0])
         self.assertEqual(["heading_1", "image"], [block["type"] for block in fake_client.appended_blocks[0][1]])
         self.assertNotIn("caption", fake_client.appended_blocks[0][1][1]["image"])
@@ -415,7 +423,8 @@ class ImporterTests(unittest.TestCase):
             [{"page_id": "existing-page", "title": "Roadmap", "erase_content": True}],
             fake_client.updated_pages,
         )
-        self.assertEqual([image], fake_client.uploaded_files)
+        self.assertEqual(1, len(fake_client.uploaded_files))
+        self.assertPathsEquivalent(image, fake_client.uploaded_files[0])
         self.assertEqual("existing-page", fake_client.appended_blocks[0][0])
         self.assertEqual(["heading_1", "image"], [block["type"] for block in fake_client.appended_blocks[0][1]])
 
